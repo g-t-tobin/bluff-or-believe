@@ -1,0 +1,11 @@
+{
+  "app": "python app.py",
+  "watch": {
+    "include": [
+      "**/*.py"
+    ]
+  },
+  "context": {
+    "@aws-cdk/core:stackRelativeExports": "true"
+  }
+}

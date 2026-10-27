@@ -1,0 +1,1015 @@
+import time
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
+from uuid import uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+from app.main import app, room_manager, session_cookie_name
+from app.room_manager import RoomAuthorizationError
+from app.room_repository import RoomWriteOutcomeUnknown
+
+client = TestClient(
+    app,
+    base_url="https://testserver",
+    headers={"origin": "http://localhost:5173"},
+)
+
+
+def websocket_headers(test_client: TestClient, room_id: str) -> dict[str, str]:
+    token = test_client.cookies.get(session_cookie_name(room_id))
+    assert token
+    return {
+        "origin": "http://localhost:5173",
+        "cookie": f"{session_cookie_name(room_id)}={token}",
+    }
+
+
+CLOUDFRONT_ORIGIN = "https://d12w3y8n7g6dw9.cloudfront.net"
+
+
+def cloudfront_client() -> TestClient:
+    return TestClient(
+        app,
+        base_url=CLOUDFRONT_ORIGIN,
+        headers={"origin": CLOUDFRONT_ORIGIN},
+    )
+
+
+def create_room_request(
+    test_client: TestClient,
+    name: str,
+    *,
+    headers: dict[str, str] | None = None,
+):
+    request_headers = dict(headers or {})
+    request_headers.setdefault("Idempotency-Key", str(uuid4()))
+    return test_client.post("/rooms", json={"name": name}, headers=request_headers)
+
+
+def make_join_key(room_id: str, name: str, nonce: str | None = None) -> str:
+    nonce = nonce or uuid4().hex * 2
+    binding = f"join-v1\0{room_id}\0{name.strip()}\0{nonce}"
+    digest = sha256(binding.encode("utf-8")).hexdigest()
+    return f"j1.{nonce}.{digest}"
+
+
+def join_request(
+    test_client: TestClient,
+    room_id: str,
+    name: str,
+    *,
+    headers: dict[str, str] | None = None,
+    idempotency_key: str | None = None,
+):
+    request_headers = dict(headers or {})
+    request_headers["Idempotency-Key"] = idempotency_key or make_join_key(room_id, name)
+    return test_client.post(
+        f"/rooms/{room_id}/players",
+        json={"name": name},
+        headers=request_headers,
+    )
+
+
+def test_room_creation_and_player_join() -> None:
+    room_response = create_room_request(client, "Table 1")
+
+    assert room_response.status_code == 201
+    room = room_response.json()
+    assert room["name"] == "Table 1"
+    assert "room_id" in room
+
+    player_response = join_request(client, room["room_id"], "Avery")
+
+    assert player_response.status_code == 201
+    player = player_response.json()["player"]
+    assert player["name"] == "Avery"
+    assert player["ready"] is False
+    assert "session_token" not in player_response.json()
+    assert "httponly" in player_response.headers["set-cookie"].lower()
+    cookie_header = player_response.headers["set-cookie"].lower()
+    assert "secure" in cookie_header
+    assert "httponly" in cookie_header
+    assert "samesite=lax" in cookie_header
+    assert "__host-" in cookie_header
+
+    rejoin_response = join_request(client, room["room_id"], "avery")
+    assert rejoin_response.status_code == 201
+    assert rejoin_response.json()["player"]["id"] == player["id"]
+    assert "session_token" not in rejoin_response.json()
+
+    stored_room = client.get(f"/rooms/{room['room_id']}")
+    assert stored_room.status_code == 200
+    assert [player["name"] for player in stored_room.json()["players"]] == ["Avery"]
+
+
+def test_room_creation_idempotency_key_returns_same_room() -> None:
+    missing_key = client.post("/rooms", json={"name": "Missing Key"})
+    assert missing_key.status_code == 422
+
+    key = str(uuid4())
+    first = client.post(
+        "/rooms",
+        json={"name": "Idempotent Create"},
+        headers={"Idempotency-Key": key},
+    )
+    retry = client.post(
+        "/rooms",
+        json={"name": "Idempotent Create"},
+        headers={"Idempotency-Key": key},
+    )
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert retry.json()["room_id"] == first.json()["room_id"]
+
+    reused_for_other_name = client.post(
+        "/rooms",
+        json={"name": "Different Room"},
+        headers={"Idempotency-Key": key},
+    )
+    assert reused_for_other_name.status_code == 400
+
+
+def test_cloudfront_origin_room_creation_join_and_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+    browser = cloudfront_client()
+    room_response = create_room_request(browser, "CloudFront Session")
+    assert room_response.status_code == 201
+    room_id = room_response.json()["room_id"]
+
+    join_response = join_request(browser, room_id, "Avery")
+    assert join_response.status_code == 201
+    cookie_header = join_response.headers["set-cookie"].lower()
+    assert "secure" in cookie_header
+    assert "httponly" in cookie_header
+    assert "samesite=lax" in cookie_header
+    assert "__host-" in cookie_header
+    assert "domain=" not in cookie_header
+
+    room_read = browser.get(f"/rooms/{room_id}")
+    assert room_read.status_code == 200
+    assert room_read.json()["players"][0]["name"] == "Avery"
+
+
+def test_players_in_separate_browser_sessions_can_join_and_read_same_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+    first_browser = cloudfront_client()
+    second_browser = cloudfront_client()
+
+    room_id = create_room_request(first_browser, "Two Browsers").json()["room_id"]
+    first_join = join_request(first_browser, room_id, "Avery")
+    second_join = join_request(second_browser, room_id, "Blake")
+
+    assert first_join.status_code == 201
+    assert second_join.status_code == 201
+    assert first_join.json()["player"]["id"] != second_join.json()["player"]["id"]
+    assert first_browser.get(f"/rooms/{room_id}").status_code == 200
+    assert second_browser.get(f"/rooms/{room_id}").status_code == 200
+    impostor_rejoin = join_request(second_browser, room_id, "Avery")
+    assert impostor_rejoin.status_code == 401
+    assert "max-age=0" in impostor_rejoin.headers["set-cookie"].lower()
+    assert second_browser.cookies.get(session_cookie_name(room_id)) is None
+
+
+def test_join_retry_recovers_cookie_after_committed_ambiguous_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+
+    class CommitThenUnreadableRepository(type(room_manager.repository)):
+        fail_next_read = False
+        timeout_join = True
+
+        def save(self, room, expected_version):
+            saved = super().save(room, expected_version)
+            if expected_version is not None and self.timeout_join:
+                self.timeout_join = False
+                self.fail_next_read = True
+                raise RoomWriteOutcomeUnknown("simulated join response loss")
+            return saved
+
+        def load(self, room_id):
+            if self.fail_next_read:
+                self.fail_next_read = False
+                raise RuntimeError("simulated reconciliation read failure")
+            return super().load(room_id)
+
+    repository = CommitThenUnreadableRepository()
+    monkeypatch.setattr(room_manager, "repository", repository)
+    browser = cloudfront_client()
+    room = create_room_request(browser, "Ambiguous Join").json()
+    room_id = room["room_id"]
+    key = make_join_key(room_id, "Avery")
+
+    uncertain = join_request(browser, room_id, "Avery", idempotency_key=key)
+    assert uncertain.status_code == 503
+    assert browser.cookies.get(session_cookie_name(room_id)) is None
+
+    recovered = join_request(browser, room_id, "Avery", idempotency_key=key)
+    assert recovered.status_code == 201
+    assert "secure" in recovered.headers["set-cookie"].lower()
+    assert "httponly" in recovered.headers["set-cookie"].lower()
+    assert "samesite=lax" in recovered.headers["set-cookie"].lower()
+    assert recovered.json()["player"]["name"] == "Avery"
+    assert browser.get(f"/rooms/{room_id}").status_code == 200
+
+    persisted = room_manager.get_room(room_id)
+    assert persisted is not None
+    assert len(persisted.players) == 1
+    assert room_manager.authenticate_session(
+        room_id,
+        browser.cookies.get(session_cookie_name(room_id)),
+    ) is not None
+
+
+def test_persistently_uncertain_join_retry_never_creates_second_player(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+
+    class PersistentlyUnreadableRepository(type(room_manager.repository)):
+        ambiguous_write = True
+        fail_reads = 0
+
+        def save(self, room, expected_version):
+            saved = super().save(room, expected_version)
+            if expected_version is not None and self.ambiguous_write:
+                self.ambiguous_write = False
+                self.fail_reads = 3
+                raise RoomWriteOutcomeUnknown("simulated uncertain join")
+            return saved
+
+        def load(self, room_id):
+            if self.fail_reads:
+                self.fail_reads -= 1
+                raise RuntimeError("simulated unavailable reads")
+            return super().load(room_id)
+
+    repository = PersistentlyUnreadableRepository()
+    monkeypatch.setattr(room_manager, "repository", repository)
+    browser = cloudfront_client()
+    room_id = create_room_request(browser, "Uncertain Join Retry").json()["room_id"]
+    key = make_join_key(room_id, "Avery")
+
+    first = join_request(browser, room_id, "Avery", idempotency_key=key)
+    second = join_request(browser, room_id, "Avery", idempotency_key=key)
+    third = join_request(browser, room_id, "Avery", idempotency_key=key)
+    assert first.status_code == 503
+    assert second.status_code == 503
+    assert "outcome could not be confirmed" in second.json()["detail"].lower()
+
+    recovered = join_request(browser, room_id, "Avery", idempotency_key=key)
+    assert third.status_code == 503
+    assert recovered.status_code == 201
+    persisted = room_manager.get_room(room_id)
+    assert persisted is not None and len(persisted.players) == 1
+    assert persisted.players[recovered.json()["player"]["id"]].join_idempotency_digest == sha256(
+        key.encode()
+    ).hexdigest()
+
+
+def test_concurrent_same_key_joins_return_one_recoverable_player(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+    room = room_manager.create_room("Concurrent Idempotent Join")
+    key = make_join_key(room.id, "Avery")
+    clients = [cloudfront_client(), cloudfront_client()]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(
+            pool.map(
+                lambda browser: join_request(
+                    browser,
+                    room.id,
+                    "Avery",
+                    idempotency_key=key,
+                ),
+                clients,
+            )
+        )
+
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json()["player"]["id"] == responses[1].json()["player"]["id"]
+    persisted = room_manager.get_room(room.id)
+    assert persisted is not None and len(persisted.players) == 1
+    for browser in clients:
+        token = browser.cookies.get(session_cookie_name(room.id))
+        assert room_manager.authenticate_session(room.id, token) is not None
+
+
+def test_join_idempotency_key_is_bound_to_room_and_player_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+    first_room = room_manager.create_room("Join Key Binding A")
+    second_room = room_manager.create_room("Join Key Binding B")
+    key = make_join_key(first_room.id, "Avery")
+
+    wrong_name = join_request(
+        cloudfront_client(),
+        first_room.id,
+        "Blake",
+        idempotency_key=key,
+    )
+    wrong_room = join_request(
+        cloudfront_client(),
+        second_room.id,
+        "Avery",
+        idempotency_key=key,
+    )
+
+    assert wrong_name.status_code == 400
+    assert wrong_room.status_code == 400
+    assert room_manager.get_room(first_room.id).players == {}
+    assert room_manager.get_room(second_room.id).players == {}
+
+
+def test_different_join_key_cannot_recover_existing_player_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+    owner = cloudfront_client()
+    intruder = cloudfront_client()
+    room_id = create_room_request(owner, "Join Takeover Guard").json()["room_id"]
+    first_key = make_join_key(room_id, "Avery")
+    joined = join_request(owner, room_id, "Avery", idempotency_key=first_key)
+    assert joined.status_code == 201
+
+    takeover = join_request(
+        intruder,
+        room_id,
+        "Avery",
+        idempotency_key=make_join_key(room_id, "Avery"),
+    )
+
+    assert takeover.status_code == 409
+    assert intruder.cookies.get(session_cookie_name(room_id)) is None
+    assert owner.get(f"/rooms/{room_id}").status_code == 200
+    persisted = room_manager.get_room(room_id)
+    assert persisted is not None and len(persisted.players) == 1
+
+
+def test_persisted_join_metadata_excludes_raw_key_and_session_token(caplog) -> None:
+    room = room_manager.create_room("No Raw Join Secrets")
+    key = make_join_key(room.id, "Avery")
+    joined = room_manager.join_room(room.id, "Avery", idempotency_key=key)
+    persisted = room_manager.get_room(room.id)
+    assert persisted is not None
+
+    state = room_manager.repository._items[room.id]["room_state"]
+    assert joined.session_token not in state
+    assert key not in state
+    assert joined.session_token not in repr(persisted.committed_operation_ids)
+    assert key not in caplog.text
+    assert persisted.players[joined.player.id].join_idempotency_digest == sha256(
+        key.encode()
+    ).hexdigest()
+    with pytest.raises(ValueError) as error:
+        room_manager.join_room(room.id, "Blake", idempotency_key=key)
+    assert key not in str(error.value)
+    assert joined.session_token not in str(error.value)
+
+
+def test_websocket_broadcasts_room_updates() -> None:
+    room_response = create_room_request(client, "Socket Room")
+    room_id = room_response.json()["room_id"]
+    joined = join_request(client, room_id, "Blake")
+    assert joined.status_code == 201
+
+    with client.websocket_connect(
+        f"/ws/rooms/{room_id}",
+        headers=websocket_headers(client, room_id),
+    ) as websocket:
+        first_message = websocket.receive_json()
+        assert first_message["type"] == "room_state"
+        players = first_message["room"]["players"]
+        assert [player["name"] for player in players] == ["Blake"]
+
+        websocket.send_json({"type": "toggle_ready", "ready": True})
+        second_message = websocket.receive_json()
+        assert second_message["type"] == "room_state"
+        assert second_message["room"]["players"][0]["ready"] is True
+
+
+def test_websocket_reports_unsaved_action_without_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_id = create_room_request(browser, "Save Failure").json()["room_id"]
+    join_request(browser, room_id, "Avery")
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("simulated storage outage")
+
+    with browser.websocket_connect(
+        f"/ws/rooms/{room_id}",
+        headers=websocket_headers(browser, room_id),
+    ) as websocket:
+        assert websocket.receive_json()["type"] == "room_state"
+        monkeypatch.setattr(room_manager.repository, "save", fail_save)
+        websocket.send_json({"type": "toggle_ready", "ready": True})
+        failure = websocket.receive_json()
+
+    assert failure == {
+        "type": "error",
+        "message": "Game action could not be saved. Please try again.",
+    }
+    monkeypatch.undo()
+    persisted = room_manager.get_room(room_id)
+    assert persisted is not None
+    assert persisted.players[next(iter(persisted.players))].ready is False
+
+
+def test_websocket_reports_uncertain_action_and_sends_latest_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_id = create_room_request(browser, "Uncertain Vote").json()["room_id"]
+    first = join_request(browser, room_id, "Avery").json()["player"]
+    second_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    second_join = join_request(second_client, room_id, "Blake")
+    second_player = second_join.json()["player"]
+    started = browser.post(f"/rooms/{room_id}/start").json()
+    voter = browser if started["game"]["speaker_id"] != first["id"] else second_client
+    expected_player_id = first["id"] if voter is browser else second_player["id"]
+
+    original_save = room_manager.repository.save
+    original_load = room_manager.repository.load
+    inject_timeout = False
+    fail_reconciliation = False
+
+    def commit_then_timeout(room, expected_version):
+        nonlocal fail_reconciliation, inject_timeout
+        result = original_save(room, expected_version)
+        if inject_timeout and expected_version is not None:
+            inject_timeout = False
+            fail_reconciliation = True
+            raise RoomWriteOutcomeUnknown("simulated lost response")
+        return result
+
+    def fail_one_reconciliation(load_room_id):
+        nonlocal fail_reconciliation
+        if fail_reconciliation:
+            fail_reconciliation = False
+            raise RuntimeError("simulated unavailable reconciliation read")
+        return original_load(load_room_id)
+
+    monkeypatch.setattr(room_manager.repository, "save", commit_then_timeout)
+    monkeypatch.setattr(room_manager.repository, "load", fail_one_reconciliation)
+    with voter.websocket_connect(
+        f"/ws/rooms/{room_id}",
+        headers=websocket_headers(voter, room_id),
+    ) as websocket:
+        initial = websocket.receive_json()
+        assert initial["type"] == "room_state"
+        inject_timeout = True
+        websocket.send_json({"type": "vote", "belief": True})
+        refreshed = websocket.receive_json()
+        uncertain = websocket.receive_json()
+
+    assert refreshed["type"] == "room_state"
+    assert any(player["id"] == expected_player_id for player in refreshed["room"]["players"])
+    assert uncertain["type"] == "error"
+    assert uncertain["code"] == "outcome_uncertain"
+    assert "do not retry" in uncertain["message"]
+
+
+def test_websocket_accepts_authenticated_cloudfront_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.main.get_cors_origins", lambda: [CLOUDFRONT_ORIGIN])
+    browser = cloudfront_client()
+    room_id = create_room_request(browser, "CloudFront Socket").json()["room_id"]
+    joined = join_request(browser, room_id, "Avery")
+    assert joined.status_code == 201
+
+    token = browser.cookies.get(session_cookie_name(room_id))
+    assert token
+    with browser.websocket_connect(
+        f"/ws/rooms/{room_id}",
+        headers={
+            "origin": CLOUDFRONT_ORIGIN,
+            "cookie": f"{session_cookie_name(room_id)}={token}",
+        },
+    ) as websocket:
+        message = websocket.receive_json()
+        assert message["type"] == "room_state"
+        assert message["room"]["players"][0]["name"] == "Avery"
+
+
+def test_websocket_reconnection_persists_expiry_without_duplicate_player() -> None:
+    browser = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_id = create_room_request(browser, "Persistent Reconnect").json()["room_id"]
+    joined = join_request(browser, room_id, "Avery")
+    assert joined.status_code == 201
+    player_id = joined.json()["player"]["id"]
+
+    room = room_manager.get_room(room_id)
+    assert room is not None
+    room.expires_at = int(time.time()) + 60
+    assert room_manager.repository.save(room, expected_version=room.version)
+
+    for _ in range(2):
+        with browser.websocket_connect(
+            f"/ws/rooms/{room_id}",
+            headers=websocket_headers(browser, room_id),
+        ) as websocket:
+            initial = websocket.receive_json()
+            assert initial["room"]["players"][0]["id"] == player_id
+
+    restored = room_manager.get_room(room_id)
+    assert restored is not None
+    assert len(restored.players) == 1
+    assert restored.players[player_id].name == "Avery"
+    assert restored.expires_at > int(time.time()) + 60
+
+
+def test_game_round_starts_and_resolves_scores() -> None:
+    room = room_manager.create_room("Game Room")
+    player_a = room_manager.join_room(room.id, "Avery").player
+    player_b = room_manager.join_room(room.id, "Blake").player
+    player_c = room_manager.join_room(room.id, "Casey").player
+
+    round_state = room_manager.start_round(room.id)
+    assert round_state.round_number == 1
+    assert round_state.speaker_id in {player_a.id, player_b.id, player_c.id}
+
+    non_speaker_ids = [
+        player.id
+        for player in (player_a, player_b, player_c)
+        if player.id != round_state.speaker_id
+    ]
+    for player_id in non_speaker_ids:
+        room_manager.cast_vote(room.id, player_id, round_state.truth_value)
+
+    room_summary = room_manager.room_summary(room.id)
+    game = room_summary["game"]
+    assert game["resolved"] is True
+    assert room_summary["scores"][round_state.speaker_id] >= 0
+    assert sum(room_summary["scores"].values()) >= 2
+
+
+def test_http_room_summaries_hide_votes_until_resolution() -> None:
+    clients = [
+        TestClient(
+            app,
+            base_url="https://testserver",
+            headers={"origin": "http://localhost:5173"},
+        )
+        for _ in range(3)
+    ]
+    room_id = create_room_request(clients[0], "Private Votes").json()["room_id"]
+    players = [
+        join_request(client, room_id, name).json()["player"]
+        for client, name in zip(clients, ("Avery", "Blake", "Casey"), strict=True)
+    ]
+
+    started = clients[0].post(f"/rooms/{room_id}/start").json()
+    game = started["game"]
+    assert game["speaker_id"] == players[0]["id"]
+    assert "truth_value" not in game
+    assert "votes" not in game
+    assert game["has_voted"] is False
+
+    first_vote = (
+        clients[1]
+        .post(
+            f"/rooms/{room_id}/vote",
+            json={"belief": True},
+        )
+        .json()["game"]
+    )
+    assert first_vote["has_voted"] is True
+    assert "truth_value" not in first_vote
+    assert "votes" not in first_vote
+
+    other_player_view = clients[2].get(f"/rooms/{room_id}").json()["game"]
+    assert other_player_view["has_voted"] is False
+    assert "truth_value" not in other_player_view
+    assert "votes" not in other_player_view
+
+    resolved = (
+        clients[2]
+        .post(
+            f"/rooms/{room_id}/vote",
+            json={"belief": False},
+        )
+        .json()["game"]
+    )
+    assert resolved["resolved"] is True
+    assert isinstance(resolved["truth_value"], bool)
+    assert resolved["votes"] == {
+        players[1]["id"]: True,
+        players[2]["id"]: False,
+    }
+
+    resolved_other_view = clients[0].get(f"/rooms/{room_id}").json()["game"]
+    assert resolved_other_view["truth_value"] == resolved["truth_value"]
+    assert resolved_other_view["votes"] == resolved["votes"]
+
+
+def test_websocket_room_messages_hide_votes_until_resolution() -> None:
+    clients = [
+        TestClient(
+            app,
+            base_url="https://testserver",
+            headers={"origin": "http://localhost:5173"},
+        )
+        for _ in range(3)
+    ]
+    room_id = create_room_request(clients[0], "Socket Privacy").json()["room_id"]
+    players = [
+        join_request(client, room_id, name).json()["player"]
+        for client, name in zip(clients, ("Avery", "Blake", "Casey"), strict=True)
+    ]
+    started = clients[0].post(f"/rooms/{room_id}/start").json()["game"]
+    assert started["speaker_id"] == players[0]["id"]
+
+    with (
+        clients[0].websocket_connect(
+            f"/ws/rooms/{room_id}",
+            headers=websocket_headers(clients[0], room_id),
+        ) as speaker_socket,
+        clients[1].websocket_connect(
+            f"/ws/rooms/{room_id}",
+            headers=websocket_headers(clients[1], room_id),
+        ) as first_voter_socket,
+        clients[2].websocket_connect(
+            f"/ws/rooms/{room_id}",
+            headers=websocket_headers(clients[2], room_id),
+        ) as second_voter_socket,
+    ):
+        for _ in range(3):
+            speaker_initial = speaker_socket.receive_json()["room"]["game"]
+        for _ in range(2):
+            first_initial = first_voter_socket.receive_json()["room"]["game"]
+        second_initial = second_voter_socket.receive_json()["room"]["game"]
+        for game in (speaker_initial, first_initial, second_initial):
+            assert "truth_value" not in game
+            assert "votes" not in game
+        assert speaker_initial["has_voted"] is False
+        assert first_initial["has_voted"] is False
+        assert second_initial["has_voted"] is False
+
+        first_voter_socket.send_json({"type": "vote", "belief": True})
+        active_views = [
+            speaker_socket.receive_json()["room"]["game"],
+            first_voter_socket.receive_json()["room"]["game"],
+            second_voter_socket.receive_json()["room"]["game"],
+        ]
+        for game in active_views:
+            assert "truth_value" not in game
+            assert "votes" not in game
+        assert [game["has_voted"] for game in active_views] == [False, True, False]
+
+        second_voter_socket.send_json({"type": "vote", "belief": False})
+        resolved_views = [
+            speaker_socket.receive_json()["room"]["game"],
+            first_voter_socket.receive_json()["room"]["game"],
+            second_voter_socket.receive_json()["room"]["game"],
+        ]
+
+    for game in resolved_views:
+        assert game["resolved"] is True
+        assert isinstance(game["truth_value"], bool)
+        assert game["votes"] == {
+            players[1]["id"]: True,
+            players[2]["id"]: False,
+        }
+
+
+def test_room_start_and_vote_endpoints() -> None:
+    owner_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    voter_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_response = create_room_request(owner_client, "Vote Room")
+    room_id = room_response.json()["room_id"]
+    player_one = join_request(owner_client, room_id, "Avery").json()["player"]
+    join_request(voter_client, room_id, "Blake").json()["player"]
+
+    started = owner_client.post(f"/rooms/{room_id}/start")
+    assert started.status_code == 200
+    assert "game" in started.json()
+
+    voter = (
+        voter_client if started.json()["game"]["speaker_id"] == player_one["id"] else owner_client
+    )
+    vote_response = voter.post(
+        f"/rooms/{room_id}/vote",
+        json={"belief": True},
+    )
+    assert vote_response.status_code == 200
+    assert "scores" in vote_response.json()
+
+    assert player_one["id"] in vote_response.json()["scores"]
+
+
+def test_rejoining_with_same_name_uses_existing_player() -> None:
+    room = room_manager.create_room("Reconnect Room")
+    first_join = room_manager.join_room(room.id, "Avery")
+
+    with pytest.raises(ValueError, match="already in use"):
+        room_manager.join_room(room.id, "avery")
+
+    second_join = room_manager.join_room(room.id, "avery", first_join.session_token)
+    assert second_join.player.id == first_join.player.id
+    assert second_join.session_token is None
+    restored_room = room_manager.get_room(room.id)
+    assert restored_room is not None
+    assert len(restored_room.players) == 1
+
+
+def test_expired_player_session_is_rejected() -> None:
+    room = room_manager.create_room("Expired Session")
+    joined = room_manager.join_room(room.id, "Avery")
+    expired_room = room_manager.get_room(room.id)
+    assert expired_room is not None
+    expired_room.players[joined.player.id].session_expires_at = time.time() - 1
+    assert room_manager.repository.save(expired_room, expected_version=expired_room.version)
+
+    assert room_manager.authenticate_session(room.id, joined.session_token) is None
+
+
+def test_player_session_is_bound_to_its_room_and_name() -> None:
+    room = room_manager.create_room("Bound Session")
+    other_room = room_manager.create_room("Other Room")
+    joined = room_manager.join_room(room.id, "Avery")
+
+    assert room_manager.authenticate_session(other_room.id, joined.session_token) is None
+    with pytest.raises(RoomAuthorizationError):
+        room_manager.join_room(room.id, "Blake", joined.session_token)
+
+
+def test_reconnect_keeps_one_active_connection_per_player() -> None:
+    room = room_manager.create_room("Reconnect Stability")
+    player = room_manager.join_room(room.id, "Avery").player
+
+    first_connection = room_manager.connect_socket(room.id, object())
+    second_connection = room_manager.connect_socket(room.id, object())
+
+    room_manager.attach_player_to_connection(room.id, first_connection, player.id)
+    room_manager.attach_player_to_connection(room.id, second_connection, player.id)
+
+    connected_room = room_manager.get_room(room.id)
+    assert connected_room is not None
+    active_connections = [
+        connection_id
+        for connection_id, connection in connected_room.connections.items()
+        if connection.get("player_id") == player.id
+    ]
+
+    assert active_connections == [second_connection]
+    assert len(connected_room.connections) == 1
+
+
+def test_duplicate_vote_is_rejected_and_round_remains_consistent() -> None:
+    room = room_manager.create_room("Vote Guard")
+    speaker = room_manager.join_room(room.id, "Avery").player
+    voter_one = room_manager.join_room(room.id, "Blake").player
+    voter_two = room_manager.join_room(room.id, "Casey").player
+
+    round_state = room_manager.start_round(room.id)
+    assert round_state.speaker_id == speaker.id
+
+    room_manager.cast_vote(room.id, voter_one.id, True)
+
+    try:
+        room_manager.cast_vote(room.id, voter_one.id, False)
+        raise AssertionError("Duplicate vote should raise ValueError")
+    except ValueError as exc:
+        assert "already voted" in str(exc)
+
+    updated_room = room_manager.get_room(room.id)
+    assert updated_room is not None and updated_room.game is not None
+    assert len(updated_room.game.votes) == 1
+    assert voter_one.id in updated_room.game.votes
+    assert voter_two.id not in updated_room.game.votes
+
+    room_manager.cast_vote(room.id, voter_two.id, False)
+    final_room = room_manager.get_room(room.id)
+    assert final_room is not None and final_room.game is not None
+    assert len(final_room.game.votes) == 2
+
+
+def test_room_reads_and_actions_require_a_valid_session() -> None:
+    room_response = create_room_request(client, "Private Table")
+    room_id = room_response.json()["room_id"]
+
+    assert client.get(f"/rooms/{room_id}").status_code == 401
+    assert client.post(f"/rooms/{room_id}/start").status_code == 401
+    assert client.post(f"/rooms/{room_id}/vote", json={"belief": True}).status_code == 401
+
+
+def test_expired_room_read_returns_401_and_clears_browser_cookie() -> None:
+    browser = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_id = create_room_request(browser, "Expired HTTP Session").json()["room_id"]
+    joined = join_request(browser, room_id, "Avery")
+    assert joined.status_code == 201
+    player_id = joined.json()["player"]["id"]
+    expired_room = room_manager.get_room(room_id)
+    assert expired_room is not None
+    expired_room.players[player_id].session_expires_at = time.time() - 1
+    assert room_manager.repository.save(expired_room, expected_version=expired_room.version)
+
+    expired_read = browser.get(f"/rooms/{room_id}")
+
+    assert expired_read.status_code == 401
+    set_cookie = expired_read.headers["set-cookie"].lower()
+    assert session_cookie_name(room_id).lower() in set_cookie
+    assert "max-age=0" in set_cookie
+    assert browser.cookies.get(session_cookie_name(room_id)) is None
+
+
+def test_missing_room_read_returns_404_and_clears_room_cookie() -> None:
+    browser = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_id = f"missing-{uuid4().hex}"
+    browser.cookies.set(session_cookie_name(room_id), "stale-session")
+    missing_read = browser.get(f"/rooms/{room_id}")
+
+    assert missing_read.status_code == 404
+    assert "max-age=0" in missing_read.headers["set-cookie"].lower()
+
+
+def test_cookie_authentication_requires_same_site_origin_on_http_mutations() -> None:
+    room_id = create_room_request(client, "Origin Check").json()["room_id"]
+    joined = join_request(client, room_id, "Avery")
+    assert joined.status_code == 201
+
+    assert (
+        client.post(
+            f"/rooms/{room_id}/start",
+            headers={"origin": "https://attacker.example"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            f"/rooms/{room_id}/vote",
+            json={"belief": True},
+            headers={"origin": ""},
+        ).status_code
+        == 403
+    )
+
+    attacker_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "https://attacker.example"},
+    )
+    other_room = create_room_request(client, "Join Origin Check").json()
+    rejected_join = join_request(attacker_client, other_room["room_id"], "Avery")
+    assert rejected_join.status_code == 403
+    assert "set-cookie" not in rejected_join.headers
+
+
+def test_invalid_session_cannot_access_room_or_websocket() -> None:
+    room_response = create_room_request(client, "Invalid Session")
+    room_id = room_response.json()["room_id"]
+    cookie_name = f"__Host-player_session_{room_id}"
+    client.cookies.set(cookie_name, "not-a-valid-session")
+
+    assert client.get(f"/rooms/{room_id}").status_code == 401
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            f"/ws/rooms/{room_id}",
+            headers={
+                "origin": "http://localhost:5173",
+                "cookie": f"{cookie_name}=not-a-valid-session",
+            },
+        ):
+            pass
+
+
+def test_player_cannot_claim_an_existing_name_or_supply_another_player_id() -> None:
+    first_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    second_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room_response = create_room_request(first_client, "Identity Table")
+    room_id = room_response.json()["room_id"]
+
+    first_player = join_request(first_client, room_id, "Avery").json()["player"]
+    duplicate = join_request(second_client, room_id, "Avery")
+    assert duplicate.status_code == 409
+
+    assert (
+        join_request(second_client, room_id, "Blake").status_code
+        == 201
+    )
+    started = first_client.post(f"/rooms/{room_id}/start")
+    assert started.status_code == 200
+
+    if started.json()["game"]["speaker_id"] == first_player["id"]:
+        voter_client = second_client
+    else:
+        voter_client = first_client
+    vote = voter_client.post(
+        f"/rooms/{room_id}/vote",
+        json={"belief": True, "player_id": first_player["id"]},
+    )
+    assert vote.status_code == 422
+
+
+def test_websocket_rejects_an_unauthenticated_connection() -> None:
+    room_response = create_room_request(client, "No Session")
+    room_id = room_response.json()["room_id"]
+    unauthenticated_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+
+    with pytest.raises(WebSocketDisconnect):
+        with unauthenticated_client.websocket_connect(f"/ws/rooms/{room_id}"):
+            pass
+
+
+def test_websocket_requires_an_allowed_origin() -> None:
+    room_id = create_room_request(client, "WebSocket Origin").json()["room_id"]
+    assert join_request(client, room_id, "Avery").status_code == 201
+    headers = websocket_headers(client, room_id)
+    headers["origin"] = "https://attacker.example"
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f"/ws/rooms/{room_id}", headers=headers):
+            pass
+
+
+def test_websocket_vote_uses_authenticated_player_not_submitted_id() -> None:
+    speaker_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    voter_client = TestClient(
+        app,
+        base_url="https://testserver",
+        headers={"origin": "http://localhost:5173"},
+    )
+    room = create_room_request(speaker_client, "Bound Vote").json()
+    room_id = room["room_id"]
+    speaker = join_request(speaker_client, room_id, "Avery").json()["player"]
+    voter = join_request(voter_client, room_id, "Blake").json()["player"]
+
+    started = speaker_client.post(f"/rooms/{room_id}/start").json()
+    assert started["game"]["speaker_id"] == speaker["id"]
+
+    with voter_client.websocket_connect(
+        f"/ws/rooms/{room_id}",
+        headers=websocket_headers(voter_client, room_id),
+    ) as websocket:
+        websocket.receive_json()
+        websocket.send_json(
+            {
+                "type": "vote",
+                "belief": True,
+                "player_id": speaker["id"],
+            }
+        )
+        updated = websocket.receive_json()["room"]
+
+    assert updated["game"]["votes"] == {voter["id"]: True}

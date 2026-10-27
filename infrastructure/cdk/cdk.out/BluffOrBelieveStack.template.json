@@ -1,0 +1,1046 @@
+{
+ "Resources": {
+  "FrontendBucketEFE2E19C": {
+   "Type": "AWS::S3::Bucket",
+   "Properties": {
+    "BucketEncryption": {
+     "ServerSideEncryptionConfiguration": [
+      {
+       "ServerSideEncryptionByDefault": {
+        "SSEAlgorithm": "AES256"
+       }
+      }
+     ]
+    },
+    "PublicAccessBlockConfiguration": {
+     "BlockPublicAcls": true,
+     "BlockPublicPolicy": true,
+     "IgnorePublicAcls": true,
+     "RestrictPublicBuckets": true
+    }
+   },
+   "UpdateReplacePolicy": "Retain",
+   "DeletionPolicy": "Retain",
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/FrontendBucket/Resource"
+   }
+  },
+  "FrontendBucketPolicy1DFF75D9": {
+   "Type": "AWS::S3::BucketPolicy",
+   "Properties": {
+    "Bucket": {
+     "Ref": "FrontendBucketEFE2E19C"
+    },
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": "s3:*",
+       "Condition": {
+        "Bool": {
+         "aws:SecureTransport": "false"
+        }
+       },
+       "Effect": "Deny",
+       "Principal": {
+        "AWS": "*"
+       },
+       "Resource": [
+        {
+         "Fn::GetAtt": [
+          "FrontendBucketEFE2E19C",
+          "Arn"
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           {
+            "Fn::GetAtt": [
+             "FrontendBucketEFE2E19C",
+             "Arn"
+            ]
+           },
+           "/*"
+          ]
+         ]
+        }
+       ]
+      },
+      {
+       "Action": [
+        "s3:GetObject*",
+        "s3:GetBucket*",
+        "s3:List*"
+       ],
+       "Effect": "Allow",
+       "Principal": {
+        "CanonicalUser": {
+         "Fn::GetAtt": [
+          "FrontendOriginAccessIdentityA5617231",
+          "S3CanonicalUserId"
+         ]
+        }
+       },
+       "Resource": [
+        {
+         "Fn::GetAtt": [
+          "FrontendBucketEFE2E19C",
+          "Arn"
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           {
+            "Fn::GetAtt": [
+             "FrontendBucketEFE2E19C",
+             "Arn"
+            ]
+           },
+           "/*"
+          ]
+         ]
+        }
+       ]
+      },
+      {
+       "Action": "s3:GetObject",
+       "Effect": "Allow",
+       "Principal": {
+        "CanonicalUser": {
+         "Fn::GetAtt": [
+          "FrontendOriginAccessIdentityA5617231",
+          "S3CanonicalUserId"
+         ]
+        }
+       },
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          {
+           "Fn::GetAtt": [
+            "FrontendBucketEFE2E19C",
+            "Arn"
+           ]
+          },
+          "/*"
+         ]
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/FrontendBucket/Policy/Resource"
+   }
+  },
+  "FrontendOriginAccessIdentityA5617231": {
+   "Type": "AWS::CloudFront::CloudFrontOriginAccessIdentity",
+   "Properties": {
+    "CloudFrontOriginAccessIdentityConfig": {
+     "Comment": "Allows CloudFront to reach the bucket"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/FrontendOriginAccessIdentity/Resource"
+   }
+  },
+  "FrontendSpaRewrite0F93FBDA": {
+   "Type": "AWS::CloudFront::Function",
+   "Properties": {
+    "AutoPublish": true,
+    "FunctionCode": "\nfunction handler(event) {\n    var request = event.request;\n    if (request.uri.lastIndexOf(\".\") < request.uri.lastIndexOf(\"/\")) {\n        request.uri = \"/index.html\";\n    }\n    return request;\n}\n",
+    "FunctionConfig": {
+     "Comment": "eu-west-1BluffOrBelieveStontendSpaRewriteBAF19DB6",
+     "Runtime": "cloudfront-js-1.0"
+    },
+    "Name": "eu-west-1BluffOrBelieveStontendSpaRewriteBAF19DB6"
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/FrontendSpaRewrite/Resource"
+   }
+  },
+  "FrontendDistributionE6EAF405": {
+   "Type": "AWS::CloudFront::Distribution",
+   "Properties": {
+    "DistributionConfig": {
+     "DefaultCacheBehavior": {
+      "AllowedMethods": [
+       "GET",
+       "HEAD",
+       "OPTIONS"
+      ],
+      "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+      "CachedMethods": [
+       "GET",
+       "HEAD",
+       "OPTIONS"
+      ],
+      "Compress": true,
+      "FunctionAssociations": [
+       {
+        "EventType": "viewer-request",
+        "FunctionARN": {
+         "Fn::GetAtt": [
+          "FrontendSpaRewrite0F93FBDA",
+          "FunctionARN"
+         ]
+        }
+       }
+      ],
+      "TargetOriginId": "BluffOrBelieveStackFrontendDistributionOrigin1E6C5D27A",
+      "ViewerProtocolPolicy": "redirect-to-https"
+     },
+     "DefaultRootObject": "index.html",
+     "Enabled": true,
+     "HttpVersion": "http2",
+     "IPV6Enabled": true,
+     "Origins": [
+      {
+       "DomainName": {
+        "Fn::GetAtt": [
+         "FrontendBucketEFE2E19C",
+         "RegionalDomainName"
+        ]
+       },
+       "Id": "BluffOrBelieveStackFrontendDistributionOrigin1E6C5D27A",
+       "S3OriginConfig": {
+        "OriginAccessIdentity": {
+         "Fn::Join": [
+          "",
+          [
+           "origin-access-identity/cloudfront/",
+           {
+            "Ref": "FrontendOriginAccessIdentityA5617231"
+           }
+          ]
+         ]
+        }
+       }
+      }
+     ],
+     "PriceClass": "PriceClass_100"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/FrontendDistribution/Resource"
+   }
+  },
+  "Vpc8378EB38": {
+   "Type": "AWS::EC2::VPC",
+   "Properties": {
+    "CidrBlock": "10.0.0.0/16",
+    "EnableDnsHostnames": true,
+    "EnableDnsSupport": true,
+    "InstanceTenancy": "default",
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "BluffOrBelieveStack/Vpc"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/Resource"
+   }
+  },
+  "VpcpublicSubnet1Subnet2BB74ED7": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "AvailabilityZone": "eu-west-1a",
+    "CidrBlock": "10.0.0.0/17",
+    "MapPublicIpOnLaunch": true,
+    "Tags": [
+     {
+      "Key": "aws-cdk:subnet-name",
+      "Value": "public"
+     },
+     {
+      "Key": "aws-cdk:subnet-type",
+      "Value": "Public"
+     },
+     {
+      "Key": "Name",
+      "Value": "BluffOrBelieveStack/Vpc/publicSubnet1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet1/Subnet"
+   }
+  },
+  "VpcpublicSubnet1RouteTable15C15F8E": {
+   "Type": "AWS::EC2::RouteTable",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "BluffOrBelieveStack/Vpc/publicSubnet1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet1/RouteTable"
+   }
+  },
+  "VpcpublicSubnet1RouteTableAssociation4E83B6E4": {
+   "Type": "AWS::EC2::SubnetRouteTableAssociation",
+   "Properties": {
+    "RouteTableId": {
+     "Ref": "VpcpublicSubnet1RouteTable15C15F8E"
+    },
+    "SubnetId": {
+     "Ref": "VpcpublicSubnet1Subnet2BB74ED7"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet1/RouteTableAssociation"
+   }
+  },
+  "VpcpublicSubnet1DefaultRouteB88F9E93": {
+   "Type": "AWS::EC2::Route",
+   "Properties": {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "GatewayId": {
+     "Ref": "VpcIGWD7BA715C"
+    },
+    "RouteTableId": {
+     "Ref": "VpcpublicSubnet1RouteTable15C15F8E"
+    }
+   },
+   "DependsOn": [
+    "VpcVPCGWBF912B6E"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet1/DefaultRoute"
+   }
+  },
+  "VpcpublicSubnet2SubnetE34B022A": {
+   "Type": "AWS::EC2::Subnet",
+   "Properties": {
+    "AvailabilityZone": "eu-west-1b",
+    "CidrBlock": "10.0.128.0/17",
+    "MapPublicIpOnLaunch": true,
+    "Tags": [
+     {
+      "Key": "aws-cdk:subnet-name",
+      "Value": "public"
+     },
+     {
+      "Key": "aws-cdk:subnet-type",
+      "Value": "Public"
+     },
+     {
+      "Key": "Name",
+      "Value": "BluffOrBelieveStack/Vpc/publicSubnet2"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet2/Subnet"
+   }
+  },
+  "VpcpublicSubnet2RouteTableC5A6DF77": {
+   "Type": "AWS::EC2::RouteTable",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "BluffOrBelieveStack/Vpc/publicSubnet2"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet2/RouteTable"
+   }
+  },
+  "VpcpublicSubnet2RouteTableAssociationCCE257FF": {
+   "Type": "AWS::EC2::SubnetRouteTableAssociation",
+   "Properties": {
+    "RouteTableId": {
+     "Ref": "VpcpublicSubnet2RouteTableC5A6DF77"
+    },
+    "SubnetId": {
+     "Ref": "VpcpublicSubnet2SubnetE34B022A"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet2/RouteTableAssociation"
+   }
+  },
+  "VpcpublicSubnet2DefaultRoute732F0BEB": {
+   "Type": "AWS::EC2::Route",
+   "Properties": {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "GatewayId": {
+     "Ref": "VpcIGWD7BA715C"
+    },
+    "RouteTableId": {
+     "Ref": "VpcpublicSubnet2RouteTableC5A6DF77"
+    }
+   },
+   "DependsOn": [
+    "VpcVPCGWBF912B6E"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/publicSubnet2/DefaultRoute"
+   }
+  },
+  "VpcIGWD7BA715C": {
+   "Type": "AWS::EC2::InternetGateway",
+   "Properties": {
+    "Tags": [
+     {
+      "Key": "Name",
+      "Value": "BluffOrBelieveStack/Vpc"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/IGW"
+   }
+  },
+  "VpcVPCGWBF912B6E": {
+   "Type": "AWS::EC2::VPCGatewayAttachment",
+   "Properties": {
+    "InternetGatewayId": {
+     "Ref": "VpcIGWD7BA715C"
+    },
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/Vpc/VPCGW"
+   }
+  },
+  "BackendCluster5086059C": {
+   "Type": "AWS::ECS::Cluster",
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendCluster/Resource"
+   }
+  },
+  "RoomsTableA5C1D45B": {
+   "Type": "AWS::DynamoDB::Table",
+   "Properties": {
+    "AttributeDefinitions": [
+     {
+      "AttributeName": "room_id",
+      "AttributeType": "S"
+     }
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+    "KeySchema": [
+     {
+      "AttributeName": "room_id",
+      "KeyType": "HASH"
+     }
+    ],
+    "PointInTimeRecoverySpecification": {
+     "PointInTimeRecoveryEnabled": false
+    },
+    "SSESpecification": {
+     "SSEEnabled": true
+    },
+    "TableName": "BluffOrBelieveRooms",
+    "TimeToLiveSpecification": {
+     "AttributeName": "expires_at",
+     "Enabled": true
+    }
+   },
+   "UpdateReplacePolicy": "Retain",
+   "DeletionPolicy": "Retain",
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/RoomsTable/Resource"
+   }
+  },
+  "BackendLogGroupDA10F1B2": {
+   "Type": "AWS::Logs::LogGroup",
+   "Properties": {
+    "RetentionInDays": 14
+   },
+   "UpdateReplacePolicy": "Retain",
+   "DeletionPolicy": "Retain",
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendLogGroup/Resource"
+   }
+  },
+  "BackendServiceLB09608E98": {
+   "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+   "Properties": {
+    "LoadBalancerAttributes": [
+     {
+      "Key": "deletion_protection.enabled",
+      "Value": "false"
+     }
+    ],
+    "Scheme": "internet-facing",
+    "SecurityGroups": [
+     {
+      "Fn::GetAtt": [
+       "BackendServiceLBSecurityGroup2B9BA648",
+       "GroupId"
+      ]
+     }
+    ],
+    "Subnets": [
+     {
+      "Ref": "VpcpublicSubnet1Subnet2BB74ED7"
+     },
+     {
+      "Ref": "VpcpublicSubnet2SubnetE34B022A"
+     }
+    ],
+    "Type": "application"
+   },
+   "DependsOn": [
+    "VpcpublicSubnet1DefaultRouteB88F9E93",
+    "VpcpublicSubnet1RouteTableAssociation4E83B6E4",
+    "VpcpublicSubnet2DefaultRoute732F0BEB",
+    "VpcpublicSubnet2RouteTableAssociationCCE257FF"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/LB/Resource"
+   }
+  },
+  "BackendServiceLBSecurityGroup2B9BA648": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "Automatically created Security Group for ELB BluffOrBelieveStackBackendServiceLBD7FEBF76",
+    "SecurityGroupIngress": [
+     {
+      "CidrIp": "0.0.0.0/0",
+      "Description": "Allow from anyone on port 80",
+      "FromPort": 80,
+      "IpProtocol": "tcp",
+      "ToPort": 80
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/LB/SecurityGroup/Resource"
+   }
+  },
+  "BackendServiceLBSecurityGrouptoBluffOrBelieveStackBackendServiceSecurityGroup774CAC4B800008CB7081": {
+   "Type": "AWS::EC2::SecurityGroupEgress",
+   "Properties": {
+    "Description": "Load balancer to target",
+    "DestinationSecurityGroupId": {
+     "Fn::GetAtt": [
+      "BackendServiceSecurityGroup7599F85E",
+      "GroupId"
+     ]
+    },
+    "FromPort": 8000,
+    "GroupId": {
+     "Fn::GetAtt": [
+      "BackendServiceLBSecurityGroup2B9BA648",
+      "GroupId"
+     ]
+    },
+    "IpProtocol": "tcp",
+    "ToPort": 8000
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/LB/SecurityGroup/to BluffOrBelieveStackBackendServiceSecurityGroup774CAC4B:8000"
+   }
+  },
+  "BackendServiceLBPublicListener2FA7FC98": {
+   "Type": "AWS::ElasticLoadBalancingV2::Listener",
+   "Properties": {
+    "DefaultActions": [
+     {
+      "TargetGroupArn": {
+       "Ref": "BackendServiceLBPublicListenerECSGroupD43CD2AB"
+      },
+      "Type": "forward"
+     }
+    ],
+    "LoadBalancerArn": {
+     "Ref": "BackendServiceLB09608E98"
+    },
+    "Port": 80,
+    "Protocol": "HTTP"
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/LB/PublicListener/Resource"
+   }
+  },
+  "BackendServiceLBPublicListenerECSGroupD43CD2AB": {
+   "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+   "Properties": {
+    "HealthCheckIntervalSeconds": 30,
+    "HealthCheckPath": "/health",
+    "HealthCheckPort": "traffic-port",
+    "HealthCheckProtocol": "HTTP",
+    "HealthCheckTimeoutSeconds": 5,
+    "HealthyThresholdCount": 2,
+    "Matcher": {
+     "HttpCode": "200-399"
+    },
+    "Port": 80,
+    "Protocol": "HTTP",
+    "TargetGroupAttributes": [
+     {
+      "Key": "stickiness.enabled",
+      "Value": "false"
+     }
+    ],
+    "TargetType": "ip",
+    "UnhealthyThresholdCount": 5,
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/LB/PublicListener/ECSGroup/Resource"
+   }
+  },
+  "BackendServiceTaskDefTaskRoleD63B95BB": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/TaskDef/TaskRole/Resource"
+   }
+  },
+  "BackendServiceTaskDefTaskRoleDefaultPolicy3BCDB2C6": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "RoomsTableA5C1D45B",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "BackendServiceTaskDefTaskRoleDefaultPolicy3BCDB2C6",
+    "Roles": [
+     {
+      "Ref": "BackendServiceTaskDefTaskRoleD63B95BB"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/TaskDef/TaskRole/DefaultPolicy/Resource"
+   }
+  },
+  "BackendServiceTaskDef9F97F56B": {
+   "Type": "AWS::ECS::TaskDefinition",
+   "Properties": {
+    "ContainerDefinitions": [
+     {
+      "Environment": [
+       {
+        "Name": "HOST",
+        "Value": "0.0.0.0"
+       },
+       {
+        "Name": "PORT",
+        "Value": "8000"
+       },
+       {
+        "Name": "AWS_REGION",
+        "Value": "eu-west-1"
+       },
+       {
+        "Name": "APP_ENV",
+        "Value": "production"
+       },
+       {
+        "Name": "CORS_ORIGINS",
+        "Value": "http://localhost:5173,http://127.0.0.1:5173"
+       },
+       {
+        "Name": "ROOMS_TABLE_NAME",
+        "Value": {
+         "Ref": "RoomsTableA5C1D45B"
+        }
+       }
+      ],
+      "Essential": true,
+      "Image": {
+       "Fn::Sub": "851725545966.dkr.ecr.eu-west-1.${AWS::URLSuffix}/cdk-hnb659fds-container-assets-851725545966-eu-west-1:abd8a73c91941281305c75a202fb4d66da48de28e89e9c061ea7915a7aea9da2"
+      },
+      "LogConfiguration": {
+       "LogDriver": "awslogs",
+       "Options": {
+        "awslogs-group": {
+         "Ref": "BackendLogGroupDA10F1B2"
+        },
+        "awslogs-stream-prefix": "bluff-or-believe-backend",
+        "awslogs-region": "eu-west-1"
+       }
+      },
+      "Name": "web",
+      "PortMappings": [
+       {
+        "ContainerPort": 8000,
+        "Protocol": "tcp"
+       }
+      ]
+     }
+    ],
+    "Cpu": "256",
+    "ExecutionRoleArn": {
+     "Fn::GetAtt": [
+      "BackendServiceTaskDefExecutionRole15BE46B5",
+      "Arn"
+     ]
+    },
+    "Family": "BluffOrBelieveStackBackendServiceTaskDefCD52C16F",
+    "Memory": "512",
+    "NetworkMode": "awsvpc",
+    "RequiresCompatibilities": [
+     "FARGATE"
+    ],
+    "TaskRoleArn": {
+     "Fn::GetAtt": [
+      "BackendServiceTaskDefTaskRoleD63B95BB",
+      "Arn"
+     ]
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/TaskDef/Resource"
+   }
+  },
+  "BackendServiceTaskDefExecutionRole15BE46B5": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/TaskDef/ExecutionRole/Resource"
+   }
+  },
+  "BackendServiceTaskDefExecutionRoleDefaultPolicyDFB9BC56": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ecr:eu-west-1:851725545966:repository/cdk-hnb659fds-container-assets-851725545966-eu-west-1"
+         ]
+        ]
+       }
+      },
+      {
+       "Action": "ecr:GetAuthorizationToken",
+       "Effect": "Allow",
+       "Resource": "*"
+      },
+      {
+       "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+       ],
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::GetAtt": [
+         "BackendLogGroupDA10F1B2",
+         "Arn"
+        ]
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "BackendServiceTaskDefExecutionRoleDefaultPolicyDFB9BC56",
+    "Roles": [
+     {
+      "Ref": "BackendServiceTaskDefExecutionRole15BE46B5"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/TaskDef/ExecutionRole/DefaultPolicy/Resource"
+   }
+  },
+  "BackendService2147DAF9": {
+   "Type": "AWS::ECS::Service",
+   "Properties": {
+    "Cluster": {
+     "Ref": "BackendCluster5086059C"
+    },
+    "DeploymentConfiguration": {
+     "Alarms": {
+      "AlarmNames": [],
+      "Enable": false,
+      "Rollback": false
+     },
+     "DeploymentCircuitBreaker": {
+      "Enable": true,
+      "Rollback": true
+     },
+     "MaximumPercent": 200,
+     "MinimumHealthyPercent": 50
+    },
+    "DeploymentController": {
+     "Type": "ECS"
+    },
+    "DesiredCount": 1,
+    "EnableECSManagedTags": false,
+    "HealthCheckGracePeriodSeconds": 60,
+    "LaunchType": "FARGATE",
+    "LoadBalancers": [
+     {
+      "ContainerName": "web",
+      "ContainerPort": 8000,
+      "TargetGroupArn": {
+       "Ref": "BackendServiceLBPublicListenerECSGroupD43CD2AB"
+      }
+     }
+    ],
+    "NetworkConfiguration": {
+     "AwsvpcConfiguration": {
+      "AssignPublicIp": "ENABLED",
+      "SecurityGroups": [
+       {
+        "Fn::GetAtt": [
+         "BackendServiceSecurityGroup7599F85E",
+         "GroupId"
+        ]
+       }
+      ],
+      "Subnets": [
+       {
+        "Ref": "VpcpublicSubnet1Subnet2BB74ED7"
+       },
+       {
+        "Ref": "VpcpublicSubnet2SubnetE34B022A"
+       }
+      ]
+     }
+    },
+    "TaskDefinition": {
+     "Ref": "BackendServiceTaskDef9F97F56B"
+    }
+   },
+   "DependsOn": [
+    "BackendServiceLBPublicListenerECSGroupD43CD2AB",
+    "BackendServiceLBPublicListener2FA7FC98",
+    "BackendServiceTaskDefTaskRoleDefaultPolicy3BCDB2C6",
+    "BackendServiceTaskDefTaskRoleD63B95BB"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/Service/Service"
+   }
+  },
+  "BackendServiceSecurityGroup7599F85E": {
+   "Type": "AWS::EC2::SecurityGroup",
+   "Properties": {
+    "GroupDescription": "BluffOrBelieveStack/BackendService/Service/SecurityGroup",
+    "SecurityGroupEgress": [
+     {
+      "CidrIp": "0.0.0.0/0",
+      "Description": "Allow all outbound traffic by default",
+      "IpProtocol": "-1"
+     }
+    ],
+    "VpcId": {
+     "Ref": "Vpc8378EB38"
+    }
+   },
+   "DependsOn": [
+    "BackendServiceTaskDefTaskRoleDefaultPolicy3BCDB2C6",
+    "BackendServiceTaskDefTaskRoleD63B95BB"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/Service/SecurityGroup/Resource"
+   }
+  },
+  "BackendServiceSecurityGroupfromBluffOrBelieveStackBackendServiceLBSecurityGroupB69B678A8000355B27AC": {
+   "Type": "AWS::EC2::SecurityGroupIngress",
+   "Properties": {
+    "Description": "Load balancer to target",
+    "FromPort": 8000,
+    "GroupId": {
+     "Fn::GetAtt": [
+      "BackendServiceSecurityGroup7599F85E",
+      "GroupId"
+     ]
+    },
+    "IpProtocol": "tcp",
+    "SourceSecurityGroupId": {
+     "Fn::GetAtt": [
+      "BackendServiceLBSecurityGroup2B9BA648",
+      "GroupId"
+     ]
+    },
+    "ToPort": 8000
+   },
+   "DependsOn": [
+    "BackendServiceTaskDefTaskRoleDefaultPolicy3BCDB2C6",
+    "BackendServiceTaskDefTaskRoleD63B95BB"
+   ],
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/BackendService/Service/SecurityGroup/from BluffOrBelieveStackBackendServiceLBSecurityGroupB69B678A:8000"
+   }
+  },
+  "CDKMetadata": {
+   "Type": "AWS::CDK::Metadata",
+   "Properties": {
+    "Analytics": "v2:deflate64:H4sIAAAAAAAA/31SXW/bMAz8LX1XtDUZtud8LEWAAg2coq8BLTMuF1kyRKqBYfi/D7bixOiKPfF4PILkgXM9//VDf3+AC89McZ5ZynV7EDBnBRc+trzQ7SqaM4pan9wVpbD3lkxzp1PeKWN9LE7BO9HtS6CS3NIYZN4V6IRk6Fj3mm2v+VKxjc4IeddLb3hDLIHyOBameafQzHX7Vpu+8rZfq33MLZlDzF1a/Y4yHwVfIbd45+/cktkbgnHIUOjBzgkGh/IEghdormOu2VIEzHuFTtQBTQwkzVPwsR4G/Jf4XQZk/ofeuYHvz2Ldrm1kwZCMS3ALoYR+ZT5v8ESOxoU/M94JkMMw4a69BwwfZJIJCXaqaBxUvsh1ezNoAJ2yvmTdPvvydseIhyWPNUhvEOtlXVsyg4HPHooVWHAGi09D0QILGeuhyAcFufJjrtuvu0OaN8mnOmJBd9WMeFJ/hVCi3NaepJ0iqHSb+XTpEO9fPf4zmnAEZhTWG2/OGHYVlP2foPQ1nWHtmcSHZgWMncqQfQzJ2JcodRQ1iA8CJbmyU/tG3r37ttCPC/348+EPE81CdEIV6izFv9NTmPuXAwAA"
+   },
+   "Metadata": {
+    "aws:cdk:path": "BluffOrBelieveStack/CDKMetadata/Default"
+   }
+  }
+ },
+ "Outputs": {
+  "BackendServiceLoadBalancerDNSE742582D": {
+   "Value": {
+    "Fn::GetAtt": [
+     "BackendServiceLB09608E98",
+     "DNSName"
+    ]
+   }
+  },
+  "BackendServiceServiceURLB1770053": {
+   "Value": {
+    "Fn::Join": [
+     "",
+     [
+      "http://",
+      {
+       "Fn::GetAtt": [
+        "BackendServiceLB09608E98",
+        "DNSName"
+       ]
+      }
+     ]
+    ]
+   }
+  },
+  "FrontendDistributionDomainName": {
+   "Value": {
+    "Fn::GetAtt": [
+     "FrontendDistributionE6EAF405",
+     "DomainName"
+    ]
+   }
+  },
+  "BackendLoadBalancerDnsName": {
+   "Value": {
+    "Fn::GetAtt": [
+     "BackendServiceLB09608E98",
+     "DNSName"
+    ]
+   }
+  },
+  "FrontendBucketName": {
+   "Value": {
+    "Ref": "FrontendBucketEFE2E19C"
+   }
+  },
+  "Region": {
+   "Value": "eu-west-1"
+  },
+  "DeploymentNote": {
+   "Value": "Room state is persisted in the retained BluffOrBelieveRooms DynamoDB table; WebSocket connections are transient."
+  }
+ },
+ "Parameters": {
+  "BootstrapVersion": {
+   "Type": "AWS::SSM::Parameter::Value<String>",
+   "Default": "/cdk-bootstrap/hnb659fds/version",
+   "Description": "Version of the CDK Bootstrap resources in this environment, automatically retrieved from SSM Parameter Store. [cdk:skip]"
+  }
+ },
+ "Rules": {
+  "CheckBootstrapVersion": {
+   "Assertions": [
+    {
+     "Assert": {
+      "Fn::Not": [
+       {
+        "Fn::Contains": [
+         [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+         ],
+         {
+          "Ref": "BootstrapVersion"
+         }
+        ]
+       }
+      ]
+     },
+     "AssertDescription": "CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' with a recent version of the CDK CLI."
+    }
+   ]
+  }
+ }
+}
