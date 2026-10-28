@@ -42,6 +42,10 @@ jobs:
     defaults:
       run:
         working-directory: frontend
+    env:
+      # Exercise the production build guard with the required same-origin API proxy.
+      VITE_API_BASE_URL: /api
+      VITE_WS_BASE_URL: ""
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
