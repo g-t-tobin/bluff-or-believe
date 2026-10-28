@@ -40,6 +40,82 @@ def _list(value: Any) -> list[Any]:
         return []
     return value if isinstance(value, list) else [value]
 
+def _contains_string(value: Any, expected: str) -> bool:
+    """Check literal strings inside CloudFormation intrinsic-function structures."""
+    if isinstance(value, str):
+        return expected in value
+    if isinstance(value, dict):
+        return any(_contains_string(item, expected) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_string(item, expected) for item in value)
+    return False
+
+
+def _has_secret_reference(value: Any) -> bool:
+    """Recognise Secrets Manager ARNs in literal, Fn::Join, or Fn::Sub form."""
+    if isinstance(value, str):
+        parts = value.split(":")
+        return (
+            len(parts) >= 7
+            and parts[0] == "arn"
+            and parts[1] == "aws"
+            and parts[2] == "secretsmanager"
+            and bool(parts[3])
+            and parts[4].isdigit()
+            and len(parts[4]) == 12
+            and parts[5] == "secret"
+            and bool(parts[6])
+        )
+
+    if isinstance(value, dict):
+        substitution = value.get("Fn::Sub")
+
+        if isinstance(substitution, str):
+            if (
+                substitution.startswith("arn:aws:secretsmanager:")
+                and ":secret:" in substitution
+                and "${AWS::Region}" in substitution
+                and "${AWS::AccountId}" in substitution
+            ):
+                return True
+            if _has_secret_reference(substitution):
+                return True
+
+        elif (
+            isinstance(substitution, list)
+            and substitution
+            and isinstance(substitution[0], str)
+        ):
+            template_string = substitution[0]
+            if (
+                template_string.startswith("arn:aws:secretsmanager:")
+                and ":secret:" in template_string
+                and "${AWS::Region}" in template_string
+                and "${AWS::AccountId}" in template_string
+            ):
+                return True
+
+        join = value.get("Fn::Join")
+        if isinstance(join, list) and len(join) == 2:
+            separator, fragments = join
+            if isinstance(separator, str) and isinstance(fragments, list):
+                literal_fragments = [
+                    fragment for fragment in fragments
+                    if isinstance(fragment, str)
+                ]
+                joined_literals = separator.join(literal_fragments)
+                if (
+                    joined_literals.startswith("arn:aws:secretsmanager:")
+                    and ":secret:" in joined_literals
+                ):
+                    return True
+
+        return any(_has_secret_reference(item) for item in value.values())
+
+    if isinstance(value, list):
+        return any(_has_secret_reference(item) for item in value)
+
+    return False
 
 def find_resources(template: dict[str, Any], resource_type: str) -> list[dict[str, Any]]:
     return [
@@ -193,20 +269,21 @@ def check_template(template: dict[str, Any]) -> list[str]:
             }:
                 errors.append("ECS task ROOMS_TABLE_NAME must reference the rooms table")
             cors = env.get("CORS_ORIGINS", "")
-            if not isinstance(cors, str) or FRONTEND_ORIGIN not in cors.split(","):
-                errors.append("ECS task CORS_ORIGINS must include the production frontend origin")
-            if isinstance(cors, str) and any(
-                "localhost" in origin.lower() or "127.0.0.1" in origin
-                for origin in cors.split(",")
-            ):
-                errors.append("ECS task production CORS_ORIGINS must not include localhost")
+            if not _contains_string(cors, FRONTEND_ORIGIN):
+                errors.append(
+                    "ECS task CORS_ORIGINS must include the production frontend origin"
+                )
+            if _contains_string(cors, "localhost") or _contains_string(cors, "127.0.0.1"):
+                errors.append(
+                    "ECS task production CORS_ORIGINS must not include localhost"
+                )
 
             secrets = {
                 item.get("Name"): item.get("ValueFrom")
                 for item in map(_dict, _list(container.get("Secrets")))
             }
             secret_ref = secrets.get("ROOM_SESSION_SECRET")
-            if not isinstance(secret_ref, dict) or not secret_ref.get("Fn::Join"):
+            if not _has_secret_reference(secret_ref):
                 errors.append(
                     "ECS task must inject ROOM_SESSION_SECRET from Secrets Manager"
                 )

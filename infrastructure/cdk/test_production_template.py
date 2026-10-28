@@ -1,6 +1,7 @@
 import json
 
 import pytest
+
 from validate_production_template import check_template, load_template
 
 
@@ -42,9 +43,10 @@ def valid_template() -> dict:
                         ],
                         "Secrets": [{
                             "Name": "ROOM_SESSION_SECRET",
-                            "ValueFrom": {
-                                "Fn::Join": ["", ["secret-arn", ":secret-value"]]
-                            },
+                            "ValueFrom": (
+                                "arn:aws:secretsmanager:eu-west-1:"
+                                "851725545966:secret:TestRoomSessionSecret-AbCd12"
+                            ),
                         }],
                     }],
                 },
