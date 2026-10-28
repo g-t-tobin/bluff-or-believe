@@ -3,7 +3,6 @@
 import os
 
 from aws_cdk import App
-
 from bluff_or_believe_stack import BluffOrBelieveStack
 from configuration import validate_production_environment
 

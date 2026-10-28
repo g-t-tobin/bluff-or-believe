@@ -416,8 +416,9 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
         except (RoomPersistenceError, ValueError):
             latest_room = None
         if latest_room is not None:
-            await websocket.send_json({"type": "room_state", "room": latest_room})
-        await websocket.send_json(
+            await room_manager.send_json(websocket, {"type": "room_state", "room": latest_room})
+        await room_manager.send_json(
+            websocket,
             {
                 "type": "error",
                 "code": "outcome_uncertain",
@@ -433,7 +434,9 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
         while True:
             payload = await websocket.receive_json()
             if not isinstance(payload, dict):
-                await websocket.send_json({"type": "error", "message": "Invalid event."})
+                await room_manager.send_json(
+                    websocket, {"type": "error", "message": "Invalid event."}
+                )
                 continue
 
             try:
@@ -444,7 +447,8 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     session_digest,
                 )
             except RoomPersistenceError:
-                await websocket.send_json(
+                await room_manager.send_json(
+                    websocket,
                     {
                         "type": "error",
                         "message": "Room storage is unavailable. Please reconnect later.",
@@ -453,21 +457,19 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                 await websocket.close(code=1013)
                 break
             if current_player is None:
-                await websocket.send_json(
+                await room_manager.send_json(
+                    websocket,
                     {"type": "error", "message": "A valid room session is required."}
                 )
                 await websocket.close(code=1008)
                 break
 
             event_type = payload.get("type")
-            room = room_manager.get_cached_room(room_id)
-            connection = room.connections.get(connection_id) if room else None
-            if (
-                connection is None
-                or connection.get("player_id") != current_player.id
-                or not room_manager.is_connection_authorized(room, connection)
+            if not room_manager.connection_is_authorized(
+                room_id, connection_id, current_player.id
             ):
-                await websocket.send_json(
+                await room_manager.send_json(
+                    websocket,
                     {"type": "error", "message": "A valid room session is required."}
                 )
                 await websocket.close(code=1008)
@@ -476,7 +478,9 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
             if event_type == "toggle_ready":
                 ready = payload.get("ready", False)
                 if not isinstance(ready, bool):
-                    await websocket.send_json({"type": "error", "message": "Invalid event."})
+                    await room_manager.send_json(
+                        websocket, {"type": "error", "message": "Invalid event."}
+                    )
                     continue
                 try:
                     await manager_call(room_manager.set_ready, room_id, current_player.id, ready)
@@ -484,7 +488,8 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     await report_uncertain_action()
                     break
                 except RoomPersistenceError:
-                    await websocket.send_json(
+                    await room_manager.send_json(
+                        websocket,
                         {
                             "type": "error",
                             "message": "Game action could not be saved. Please try again.",
@@ -492,7 +497,7 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     )
                     continue
                 except ValueError as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    await room_manager.send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
 
             elif event_type == "start_game":
@@ -502,7 +507,8 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     await report_uncertain_action()
                     break
                 except RoomPersistenceError:
-                    await websocket.send_json(
+                    await room_manager.send_json(
+                        websocket,
                         {
                             "type": "error",
                             "message": "Game action could not be saved. Please try again.",
@@ -510,13 +516,15 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     )
                     continue
                 except ValueError as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    await room_manager.send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
 
             elif event_type == "vote":
                 belief = payload.get("belief")
                 if not isinstance(belief, bool):
-                    await websocket.send_json({"type": "error", "message": "Invalid event."})
+                    await room_manager.send_json(
+                        websocket, {"type": "error", "message": "Invalid event."}
+                    )
                     continue
                 try:
                     await manager_call(
@@ -529,7 +537,8 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     await report_uncertain_action()
                     break
                 except RoomPersistenceError:
-                    await websocket.send_json(
+                    await room_manager.send_json(
+                        websocket,
                         {
                             "type": "error",
                             "message": "Game action could not be saved. Please try again.",
@@ -537,13 +546,15 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                     )
                     continue
                 except ValueError as exc:
-                    await websocket.send_json({"type": "error", "message": str(exc)})
+                    await room_manager.send_json(websocket, {"type": "error", "message": str(exc)})
                     continue
 
             elif event_type == "chat":
                 message = payload.get("message")
                 if not isinstance(message, str) or not message.strip():
-                    await websocket.send_json({"type": "error", "message": "Invalid event."})
+                    await room_manager.send_json(
+                        websocket, {"type": "error", "message": "Invalid event."}
+                    )
                     continue
                 await room_manager.broadcast_room_message(
                     room_id,
@@ -553,7 +564,9 @@ async def room_socket(websocket: WebSocket, room_id: str) -> None:
                 continue
 
             else:
-                await websocket.send_json({"type": "error", "message": "Unsupported event."})
+                await room_manager.send_json(
+                    websocket, {"type": "error", "message": "Unsupported event."}
+                )
                 continue
 
             await room_manager.broadcast_room_state(room_id)

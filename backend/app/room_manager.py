@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import random
 import re
 import secrets
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from hashlib import sha256
 from hmac import compare_digest
@@ -109,7 +111,32 @@ class RoomManager:
         if len(self._session_secret) < 32:
             raise ValueError("Room session secret must contain at least 32 bytes.")
         self._rooms: dict[str, Room] = {}
+        # Live sockets are process-local; one registry per room outlives every cached Room
+        # replacement so that persistence paths can never drop or fork it.
+        self._connections: dict[str, dict[str, dict[str, object]]] = {}
         self._lock = threading.RLock()
+        # One asyncio lock per socket serialises send_json(); never held with self._lock
+        # across an await.
+        self._send_locks: weakref.WeakKeyDictionary[object, asyncio.Lock] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def _send_lock(self, websocket: object) -> asyncio.Lock:
+        with self._lock:
+            lock = self._send_locks.get(websocket)
+            if lock is None:
+                lock = self._send_locks[websocket] = asyncio.Lock()
+            return lock
+
+    def _install_room(self, room_id: str, room: Room) -> None:
+        with self._lock:
+            room.connections = self._connections.setdefault(room_id, {})
+            self._rooms[room_id] = room
+
+    def _evict_room(self, room_id: str) -> None:
+        with self._lock:
+            self._rooms.pop(room_id, None)
+            self._connections.pop(room_id, None)
 
     def create_room(self, name: str, operation_id: str | None = None) -> Room:
         room_name = name.strip()
@@ -127,7 +154,7 @@ class RoomManager:
                 if operation_id in existing.committed_operation_ids and existing.name == room_name:
                     if existing.expires_at <= time.time():
                         raise ValueError("This room creation key belongs to an expired room.")
-                    self._rooms[room_id] = existing
+                    self._install_room(room_id, existing)
                     return existing
                 raise ValueError("This room creation key has already been used.")
 
@@ -181,8 +208,7 @@ class RoomManager:
                 f"Room creation outcome is uncertain for room '{room.id}'."
             ) from last_error
 
-        with self._lock:
-            self._rooms[room.id] = room
+        self._install_room(room.id, room)
         return room
 
     def get_room(self, room_id: str) -> Room | None:
@@ -195,14 +221,9 @@ class RoomManager:
         except Exception as exc:
             raise RoomPersistenceError("Unable to load room state.") from exc
         if room is None or room.expires_at <= time.time():
-            with self._lock:
-                self._rooms.pop(room_id, None)
+            self._evict_room(room_id)
             return None
-        with self._lock:
-            cached_room = self._rooms.get(room_id)
-            if cached_room is not None:
-                room.connections = cached_room.connections
-            self._rooms[room_id] = room
+        self._install_room(room_id, room)
         return room
 
     def join_room(
@@ -375,47 +396,51 @@ class RoomManager:
         return sha256(session_token.encode("utf-8")).hexdigest()
 
     def connect_socket(self, room_id: str, websocket: WebSocket) -> str:
-        room = self._rooms.get(room_id)
-        if room is None:
-            raise ValueError(f"Unknown room '{room_id}'.")
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                raise ValueError(f"Unknown room '{room_id}'.")
 
-        connection_id = uuid4().hex
-        room.connections[connection_id] = {"websocket": websocket, "player_id": None}
-        return connection_id
+            connection_id = uuid4().hex
+            room.connections[connection_id] = {"websocket": websocket, "player_id": None}
+            return connection_id
 
     def attach_player_to_connection(self, room_id: str, connection_id: str, player_id: str) -> None:
-        room = self._rooms.get(room_id)
-        if room is None:
-            raise ValueError(f"Unknown room '{room_id}'.")
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                raise ValueError(f"Unknown room '{room_id}'.")
 
-        connection = room.connections.get(connection_id)
-        if connection is None:
-            raise ValueError("Unknown socket connection.")
+            connection = room.connections.get(connection_id)
+            if connection is None:
+                raise ValueError("Unknown socket connection.")
 
-        player = room.players.get(player_id)
-        if player is None or player.session_expires_at <= time.time():
-            raise RoomAuthorizationError("A valid room session is required.")
+            player = room.players.get(player_id)
+            if player is None or player.session_expires_at <= time.time():
+                raise RoomAuthorizationError("A valid room session is required.")
 
-        for active_connection_id, active_connection in list(room.connections.items()):
-            if (
-                active_connection_id != connection_id
-                and active_connection.get("player_id") == player_id
-            ):
-                active_connection["player_id"] = None
-                room.connections.pop(active_connection_id, None)
+            for active_connection_id, active_connection in list(room.connections.items()):
+                if (
+                    active_connection_id != connection_id
+                    and active_connection.get("player_id") == player_id
+                ):
+                    active_connection["player_id"] = None
+                    room.connections.pop(active_connection_id, None)
 
-        connection["player_id"] = player_id
-        connection["session_digest"] = player.session_digest
+            connection["player_id"] = player_id
+            connection["session_digest"] = player.session_digest
 
     def disconnect_socket(self, room_id: str, connection_id: str) -> None:
-        room = self._rooms.get(room_id)
-        if room is None:
-            return
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                return
 
-        room.connections.pop(connection_id, None)
+            room.connections.pop(connection_id, None)
 
     def get_cached_room(self, room_id: str) -> Room | None:
-        return self._rooms.get(room_id)
+        with self._lock:
+            return self._rooms.get(room_id)
 
     def set_ready(self, room_id: str, player_id: str, ready: bool) -> Player:
         def update(candidate: Room) -> Player:
@@ -529,19 +554,16 @@ class RoomManager:
                         ) from last_ambiguous_error
                     raise ValueError(f"Unknown room '{room_id}'.")
                 if current.expires_at <= time.time():
-                    self._rooms.pop(room_id, None)
+                    self._evict_room(room_id)
                     if pending_candidate is not None:
                         raise RoomOutcomeUncertainError(
                             "Action outcome is uncertain; refresh the room before retrying."
                         ) from last_ambiguous_error
                     raise ValueError("Room has expired.")
 
-                cached = self._rooms.get(room_id)
                 if pending_candidate is not None:
                     if operation_id in current.committed_operation_ids:
-                        if cached is not None:
-                            current.connections = cached.connections
-                        self._rooms[room_id] = current
+                        self._install_room(room_id, current)
                         return pending_result
                     if current.version == pending_expected_version:
                         try:
@@ -558,7 +580,7 @@ class RoomManager:
                         except Exception as exc:
                             raise RoomPersistenceError("Unable to save room state.") from exc
                         if saved:
-                            self._rooms[room_id] = pending_candidate
+                            self._install_room(room_id, pending_candidate)
                             return pending_result
                         # The original candidate can no longer commit after this CAS
                         # conflict. Reload on the next pass and check its receipt first.
@@ -576,13 +598,11 @@ class RoomManager:
                     pending_expected_version = None
                     last_ambiguous_error = None
 
-                if cached is not None:
-                    current.connections = cached.connections
                 try:
                     candidate = room_from_item(room_to_item(current))
                 except RoomRepositoryError as exc:
                     raise RoomPersistenceError("Unable to serialize room state.") from exc
-                candidate.connections = current.connections
+                candidate.connections = self._connections.setdefault(room_id, {})
                 result = operation(candidate)
                 now = time.time()
                 candidate.version = current.version + 1
@@ -606,7 +626,7 @@ class RoomManager:
                 except Exception as exc:
                     raise RoomPersistenceError("Unable to save room state.") from exc
                 if saved:
-                    self._rooms[room_id] = candidate
+                    self._install_room(room_id, candidate)
                     return result
             if pending_candidate is not None:
                 raise RoomOutcomeUncertainError(
@@ -630,10 +650,11 @@ class RoomManager:
         room_id: str,
         viewer_player_id: str | None = None,
     ) -> dict[str, object]:
-        room = self._rooms.get(room_id)
-        if room is None or room.expires_at <= time.time():
-            raise ValueError(f"Unknown room '{room_id}'.")
-        return self._room_summary(room, viewer_player_id)
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None or room.expires_at <= time.time():
+                raise ValueError(f"Unknown room '{room_id}'.")
+            return self._room_summary(room, viewer_player_id)
 
     @staticmethod
     def _room_summary(room: Room, viewer_player_id: str | None) -> dict[str, object]:
@@ -664,46 +685,94 @@ class RoomManager:
 
         return payload
 
-    async def broadcast_room_state(self, room_id: str) -> None:
-        room = self._rooms.get(room_id)
-        if room is None:
-            return
+    async def send_json(self, websocket: WebSocket, payload: dict[str, object]) -> None:
+        """Send directly to one socket, serialised with broadcasts to the same socket."""
+        async with self._send_lock(websocket):
+            await websocket.send_json(payload)
 
-        for connection_id, connection in list(room.connections.items()):
-            if not self.is_connection_authorized(room, connection):
-                room.connections.pop(connection_id, None)
-                continue
-            websocket = connection["websocket"]
-            if isinstance(websocket, WebSocket):
-                player_id = connection.get("player_id")
-                await websocket.send_json(
-                    {
-                        "type": "room_state",
-                        "room": self._room_summary(
-                            room,
-                            player_id if isinstance(player_id, str) else None,
-                        ),
-                    }
+    def connection_is_authorized(self, room_id: str, connection_id: str, player_id: str) -> bool:
+        with self._lock:
+            room = self._rooms.get(room_id)
+            connection = room.connections.get(connection_id) if room else None
+            return bool(
+                room is not None
+                and connection is not None
+                and connection.get("player_id") == player_id
+                and self.is_connection_authorized(room, connection)
+            )
+
+    def _discard_connection(
+        self,
+        room_id: str,
+        connection_id: str,
+        connection: dict[str, object],
+    ) -> None:
+        # Identity check: only remove the exact record that failed, never a replacement.
+        with self._lock:
+            registry = self._connections.get(room_id)
+            if registry is not None and registry.get(connection_id) is connection:
+                registry.pop(connection_id, None)
+
+    def _snapshot_connections(self, room_id: str) -> list[tuple[str, dict[str, object]]]:
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                return []
+            return list(room.connections.items())
+
+    async def _deliver(self, room_id: str, connection_id: str, connection, build_payload) -> None:
+        websocket = connection.get("websocket")
+        if not callable(getattr(websocket, "send_json", None)):
+            return
+        async with self._send_lock(websocket):
+            # Re-validate and build the payload while holding the send lock so that the
+            # newest state is always sent last and removed or replaced sockets are skipped.
+            with self._lock:
+                room = self._rooms.get(room_id)
+                registry = self._connections.get(room_id)
+                current = registry.get(connection_id) if registry is not None else None
+                if room is None or current is not connection:
+                    return
+                if not self.is_connection_authorized(room, connection):
+                    registry.pop(connection_id, None)
+                    return
+                payload = build_payload(room, connection)
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                # A dead socket must not stop delivery to the other players.
+                self._discard_connection(room_id, connection_id, connection)
+
+    async def _broadcast(self, room_id: str, build_payload) -> None:
+        targets = self._snapshot_connections(room_id)
+        if targets:
+            await asyncio.gather(
+                *(
+                    self._deliver(room_id, connection_id, connection, build_payload)
+                    for connection_id, connection in targets
                 )
+            )
+
+    async def broadcast_room_state(self, room_id: str) -> None:
+        def build(room: Room, connection: dict[str, object]) -> dict[str, object]:
+            player_id = connection.get("player_id")
+            return {
+                "type": "room_state",
+                "room": self._room_summary(
+                    room,
+                    player_id if isinstance(player_id, str) else None,
+                ),
+            }
+
+        await self._broadcast(room_id, build)
 
     async def broadcast_room_message(self, room_id: str, author: str, message: str) -> None:
-        room = self._rooms.get(room_id)
-        if room is None:
-            return
-
         payload = {
             "type": "chat",
             "author": author,
             "message": message,
         }
-
-        for connection_id, connection in list(room.connections.items()):
-            if not self.is_connection_authorized(room, connection):
-                room.connections.pop(connection_id, None)
-                continue
-            websocket = connection["websocket"]
-            if isinstance(websocket, WebSocket):
-                await websocket.send_json(payload)
+        await self._broadcast(room_id, lambda room, connection: payload)
 
     @staticmethod
     def is_connection_authorized(room: Room, connection: dict[str, object]) -> bool:
