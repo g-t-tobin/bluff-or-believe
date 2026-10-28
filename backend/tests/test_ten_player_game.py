@@ -50,25 +50,30 @@ def test_ten_players_can_join_play_a_round_and_receive_shared_state() -> None:
 
         # Start one round. The speaker cannot vote; the other nine players can.
         round_state = manager.start_round(room.id)
+        speaker_id = round_state.speaker_id
         await manager.broadcast_room_state(room.id)
-        assert round_state.speaker_id in {player.id for player in players}
+        assert speaker_id in {player.id for player in players}
 
         for socket in sockets:
             game = socket.messages[-1]["room"]["game"]
             assert game["round_number"] == 1
-            assert game["speaker_id"] == round_state.speaker_id
+            assert game["speaker_id"] == speaker_id
             assert game["resolved"] is False
 
         votes_cast = 0
         for player in players:
-            if player.id == round_state.speaker_id:
+            if player.id == speaker_id:
                 continue
             manager.cast_vote(room.id, player.id, votes_cast % 2 == 0)
             votes_cast += 1
             await manager.broadcast_room_state(room.id)
 
         assert votes_cast == 9
-        assert round_state.resolved is True
+        # Mutations replace the persisted room snapshot, so read the current state.
+        current_room = manager.get_room(room.id)
+        assert current_room is not None
+        assert current_room.game is not None
+        assert current_room.game.resolved is True
 
         # All ten clients receive the resolved result, including the nine votes.
         for socket in sockets:
@@ -80,7 +85,7 @@ def test_ten_players_can_join_play_a_round_and_receive_shared_state() -> None:
             assert isinstance(game["truth_value"], bool)
             assert len(game["votes"]) == 9
             assert set(game["votes"]) == {
-                player.id for player in players if player.id != round_state.speaker_id
+                player.id for player in players if player.id != speaker_id
             }
 
         # A chat message should also fan out to every connected player.
